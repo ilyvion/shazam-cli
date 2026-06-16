@@ -26,4 +26,4 @@ Once a backend feature is finished, run these checks in order:
 1. `cargo clippy --workspace --all-targets` — Clippy/compiler errors
 2. `cargo test --workspace` — tests
 
-Organize functions top-down: higher-level concepts and callers come first, helpers and lower-level functions come later. A function should never call a function defined above it in the file.
+Organize functions and types top-down: higher-level concepts and callers come first, helpers and lower-level functions come later. A function should never call a function defined above it in the file. Types used by functions go below them, a function should never use a type declared above it in the file. Types used by other types go below them, a type should never use a type declared above it in the file.

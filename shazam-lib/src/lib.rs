@@ -5,128 +5,67 @@
 mod response;
 
 use std::path::Path;
+use std::str::FromStr;
 
 use base64::{Engine as _, engine::general_purpose};
 use miette::Diagnostic;
 use tracing::{debug, trace};
 
-/// Context about what was extracted from a file, used to validate the API response.
-#[derive(Debug, Clone, Copy)]
-pub struct ExtractionContext {
-    /// Total duration of the source file in milliseconds.
-    pub file_duration_ms: u64,
-    /// Start of the extracted sample within the file in milliseconds.
-    pub sample_start_ms: u64,
-}
-
-/// Identifies a song by extracting a sample from the middle of the audio file
-/// and sending it to the Shazam API.
+/// Identifies a song by extracting a sample from the audio file and sending it to the Shazam API.
+///
+/// `sample_at` controls where in the file the sample is drawn from.
 ///
 /// # Errors
 ///
 /// Returns [`ShazamError`] if the audio file cannot be read, the sample cannot
 /// be extracted, or the API request fails.
-#[tracing::instrument(skip(api_key, path, sample_duration_ms))]
+#[tracing::instrument(skip(api_key, path, sample_duration_ms, sample_at))]
 pub async fn identify_song(
     path: &Path,
     api_key: &str,
     sample_duration_ms: u64,
+    sample_at: SampleAt,
 ) -> Result<String, ShazamError> {
-    let (raw_audio, context) = extract_audio_sample(path, sample_duration_ms)?;
+    let (raw_audio, context) = extract_audio_sample(path, sample_duration_ms, sample_at)?;
     let encoded = encode_to_base64(&raw_audio);
     send_to_shazam(&encoded, api_key, sample_duration_ms, &context).await
 }
 
-/// Parses a raw Shazam API JSON response and formats it for human-readable display.
-///
-/// `context` provides information about what was extracted from the source file, enabling
-/// the formatter to flag mismatches between the file and the identified song.
-///
-/// # Errors
-///
-/// Returns [`ShazamError::ParseResponse`] if the JSON cannot be parsed.
-pub fn format_shazam_response(
-    json: &str,
-    context: Option<&ExtractionContext>,
-) -> Result<String, ShazamError> {
-    let parsed: response::ShazamResponse =
-        serde_json::from_str(json).map_err(|e| ShazamError::ParseResponse(e.to_string()))?;
-    Ok(parsed.format_display(context))
-}
-
-#[tracing::instrument(skip(encoded, api_key), fields(encoded_bytes = encoded.len()))]
-async fn send_to_shazam(
-    encoded: &str,
-    api_key: &str,
-    sample_ms: u64,
-    context: &ExtractionContext,
-) -> Result<String, ShazamError> {
-    debug!(
-        encoded_bytes = encoded.len(),
-        sample_ms, "sending request to Shazam API"
-    );
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://shazam.p.rapidapi.com/songs/v3/detect")
-        .query(&[
-            ("timezone", "UTC"),
-            ("locale", "en-US"),
-            ("samplems", sample_ms.to_string().as_str()),
-        ])
-        .header("X-RapidAPI-Host", "shazam.p.rapidapi.com")
-        .header("X-RapidAPI-Key", api_key)
-        .header("Content-Type", "text/plain")
-        .body(encoded.to_owned())
-        .send()
-        .await?;
-
-    let status = response.status();
-    debug!(%status, "received response from Shazam API");
-    let body = response.text().await?;
-    format_shazam_response(&body, Some(context))
-}
-
-#[tracing::instrument(skip(path, sample_duration_ms))]
+#[tracing::instrument(skip(path, sample_duration_ms, sample_at))]
 fn extract_audio_sample(
     path: &Path,
     sample_duration_ms: u64,
+    sample_at: SampleAt,
 ) -> Result<(Vec<u8>, ExtractionContext), ShazamError> {
-    let (mut ictx, stream_index, decoder, start_ms, end_ms, total_ms) =
-        open_input(path, sample_duration_ms)?;
+    let mut input = open_input(path, sample_duration_ms, sample_at)?;
 
-    let seek_us = i64::try_from(start_ms.saturating_mul(1_000)).unwrap_or(i64::MAX);
+    let seek_us = i64::try_from(input.start_ms.saturating_mul(1_000)).unwrap_or(i64::MAX);
     debug!(seek_us, "seeking");
-    ictx.seek(seek_us, ..seek_us)
+    input
+        .ictx
+        .seek(seek_us, ..seek_us)
         .map_err(|e| ShazamError::Seek(e.to_string()))?;
 
-    let actual_sample_ms = end_ms - start_ms;
+    let actual_sample_ms = input.end_ms - input.start_ms;
     let target_bytes =
         usize::try_from(44_100_u64 * 2 * actual_sample_ms / 1_000).unwrap_or(usize::MAX);
     debug!(actual_sample_ms, target_bytes, "collecting audio");
 
-    let bytes = collect_audio_bytes(ictx, stream_index, decoder, end_ms, target_bytes)?;
     let context = ExtractionContext {
-        file_duration_ms: total_ms,
-        sample_start_ms: start_ms,
+        file_duration_ms: input.total_ms,
+        sample_start_ms: input.start_ms,
     };
+    let bytes =
+        collect_audio_bytes(input.ictx, input.stream_index, input.decoder, input.end_ms, target_bytes)?;
     Ok((bytes, context))
 }
 
-#[tracing::instrument(skip(path, sample_duration_ms))]
+#[tracing::instrument(skip(path, sample_duration_ms, sample_at))]
 fn open_input(
     path: &Path,
     sample_duration_ms: u64,
-) -> Result<
-    (
-        ffmpeg_next::format::context::Input,
-        usize,
-        ffmpeg_next::codec::decoder::Audio,
-        u64,
-        u64,
-        u64,
-    ),
-    ShazamError,
-> {
+    sample_at: SampleAt,
+) -> Result<OpenedInput, ShazamError> {
     ffmpeg_next::init().map_err(|e| ShazamError::FfmpegInit(e.to_string()))?;
 
     let ictx = ffmpeg_next::format::input(path).map_err(|e| ShazamError::OpenFile {
@@ -171,10 +110,50 @@ fn open_input(
         "created audio decoder"
     );
 
-    let (start_ms, end_ms) = compute_sample_window(total_ms, sample_duration_ms);
+    let (start_ms, end_ms) = compute_sample_window(total_ms, sample_duration_ms, sample_at)?;
     debug!(start_ms, end_ms, "computed sample window");
 
-    Ok((ictx, stream_index, decoder, start_ms, end_ms, total_ms))
+    Ok(OpenedInput { ictx, stream_index, decoder, start_ms, end_ms, total_ms })
+}
+
+fn compute_sample_window(
+    total_duration_ms: u64,
+    sample_duration_ms: u64,
+    sample_at: SampleAt,
+) -> Result<(u64, u64), ShazamError> {
+    match sample_at {
+        SampleAt::Percentage(pct) => {
+            let actual_sample = sample_duration_ms.min(total_duration_ms);
+            // pct is validated 0.0–100.0 at parse time; precision loss in ms is acceptable
+            #[expect(
+                clippy::cast_precision_loss,
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation,
+                reason = "pct ∈ [0, 100] by construction; ms-level precision loss is acceptable"
+            )]
+            let center_ms = (total_duration_ms as f64 * pct / 100.0) as u64;
+            let half = actual_sample / 2;
+            let start = center_ms.saturating_sub(half);
+            let end = start + actual_sample;
+            if end > total_duration_ms {
+                let clamped_start = total_duration_ms - actual_sample;
+                Ok((clamped_start, total_duration_ms))
+            } else {
+                Ok((start, end))
+            }
+        }
+        SampleAt::AbsoluteMs(start_ms) => {
+            let end_ms = start_ms
+                .checked_add(sample_duration_ms)
+                .filter(|&end| end <= total_duration_ms)
+                .ok_or(ShazamError::SampleOutOfBounds {
+                    start_ms,
+                    end_ms: start_ms.saturating_add(sample_duration_ms),
+                    total_ms: total_duration_ms,
+                })?;
+            Ok((start_ms, end_ms))
+        }
+    }
 }
 
 #[expect(clippy::too_many_lines)]
@@ -314,20 +293,131 @@ fn normalise_channel_layout(frame: &mut ffmpeg_next::frame::Audio) {
     }
 }
 
-const fn compute_sample_window(total_duration_ms: u64, sample_duration_ms: u64) -> (u64, u64) {
-    let actual_sample = if sample_duration_ms <= total_duration_ms {
-        sample_duration_ms
-    } else {
-        total_duration_ms
-    };
-    let half_total = total_duration_ms / 2;
-    let half_sample = actual_sample / 2;
-    let start = half_total.saturating_sub(half_sample);
-    (start, start + actual_sample)
-}
-
 fn encode_to_base64(data: &[u8]) -> String {
     general_purpose::STANDARD.encode(data)
+}
+
+#[tracing::instrument(skip(encoded, api_key), fields(encoded_bytes = encoded.len()))]
+async fn send_to_shazam(
+    encoded: &str,
+    api_key: &str,
+    sample_ms: u64,
+    context: &ExtractionContext,
+) -> Result<String, ShazamError> {
+    debug!(
+        encoded_bytes = encoded.len(),
+        sample_ms, "sending request to Shazam API"
+    );
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://shazam.p.rapidapi.com/songs/v3/detect")
+        .query(&[
+            ("timezone", "UTC"),
+            ("locale", "en-US"),
+            ("samplems", sample_ms.to_string().as_str()),
+        ])
+        .header("X-RapidAPI-Host", "shazam.p.rapidapi.com")
+        .header("X-RapidAPI-Key", api_key)
+        .header("Content-Type", "text/plain")
+        .body(encoded.to_owned())
+        .send()
+        .await?;
+
+    let status = response.status();
+    debug!(%status, "received response from Shazam API");
+    let body = response.text().await?;
+    format_shazam_response(&body, Some(context))
+}
+
+/// Parses a raw Shazam API JSON response and formats it for human-readable display.
+///
+/// `context` provides information about what was extracted from the source file, enabling
+/// the formatter to flag mismatches between the file and the identified song.
+///
+/// # Errors
+///
+/// Returns [`ShazamError::ParseResponse`] if the JSON cannot be parsed.
+pub fn format_shazam_response(
+    json: &str,
+    context: Option<&ExtractionContext>,
+) -> Result<String, ShazamError> {
+    let parsed: response::ShazamResponse =
+        serde_json::from_str(json).map_err(|e| ShazamError::ParseResponse(e.to_string()))?;
+    Ok(parsed.format_display(context))
+}
+
+/// Context about what was extracted from a file, used to validate the API response.
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractionContext {
+    /// Total duration of the source file in milliseconds.
+    pub file_duration_ms: u64,
+    /// Start of the extracted sample within the file in milliseconds.
+    pub sample_start_ms: u64,
+}
+
+struct OpenedInput {
+    ictx: ffmpeg_next::format::context::Input,
+    stream_index: usize,
+    decoder: ffmpeg_next::codec::decoder::Audio,
+    start_ms: u64,
+    end_ms: u64,
+    total_ms: u64,
+}
+
+/// Where in the audio file to draw the sample from.
+#[derive(Debug, Clone, Copy)]
+pub enum SampleAt {
+    /// Center the sample window at this percentage (0.0–100.0) of the song.
+    ///
+    /// Values are clamped so the window stays within the song.
+    Percentage(f64),
+    /// Start the sample window at this absolute offset (milliseconds).
+    ///
+    /// Rejected if `offset + sample_duration` would exceed the song length.
+    AbsoluteMs(u64),
+}
+
+impl Default for SampleAt {
+    fn default() -> Self {
+        Self::Percentage(50.0)
+    }
+}
+
+impl FromStr for SampleAt {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if let Some(pct_str) = s.strip_suffix('%') {
+            let pct: f64 = pct_str
+                .parse()
+                .map_err(|_| format!("invalid percentage: {s:?}"))?;
+            if !(0.0..=100.0).contains(&pct) {
+                return Err(format!("percentage must be between 0 and 100, got {pct}"));
+            }
+            Ok(Self::Percentage(pct))
+        } else if let Some((min_str, sec_str)) = s.split_once(':') {
+            if sec_str.len() != 2 {
+                return Err(format!(
+                    "seconds must be exactly two digits (e.g. 2:05), got {s:?}"
+                ));
+            }
+            let minutes: u64 = min_str
+                .parse()
+                .map_err(|_| format!("invalid time: {s:?}"))?;
+            let seconds: u64 = sec_str
+                .parse()
+                .map_err(|_| format!("invalid time: {s:?}"))?;
+            if seconds >= 60 {
+                return Err(format!("seconds must be 0–59, got {seconds}"));
+            }
+            let ms = (minutes * 60 + seconds) * 1_000;
+            Ok(Self::AbsoluteMs(ms))
+        } else {
+            Err(format!(
+                "expected a percentage (e.g. 50%) or a time (e.g. 2:00), got {s:?}"
+            ))
+        }
+    }
 }
 
 /// Error variants for Shazam CLI operations.
@@ -381,6 +471,19 @@ pub enum ShazamError {
     /// The API response JSON could not be parsed.
     #[error("Failed to parse API response: {0}")]
     ParseResponse(String),
+
+    /// The absolute sample window falls outside the song duration.
+    #[error(
+        "Sample window {start_ms}ms–{end_ms}ms extends beyond the song length ({total_ms}ms)"
+    )]
+    SampleOutOfBounds {
+        /// Sample start in milliseconds.
+        start_ms: u64,
+        /// Computed sample end in milliseconds.
+        end_ms: u64,
+        /// Total song duration in milliseconds.
+        total_ms: u64,
+    },
 }
 
 #[cfg(test)]
@@ -389,29 +492,125 @@ mod tests {
 
     #[test]
     fn test_compute_sample_window_normal() {
-        let (start, end) = compute_sample_window(60_000, 4_000);
+        let (start, end) =
+            compute_sample_window(60_000, 4_000, SampleAt::Percentage(50.0)).unwrap();
         assert_eq!(start, 28_000);
         assert_eq!(end, 32_000);
     }
 
     #[test]
     fn test_compute_sample_window_short_file() {
-        let (start, end) = compute_sample_window(2_000, 4_000);
+        let (start, end) =
+            compute_sample_window(2_000, 4_000, SampleAt::Percentage(50.0)).unwrap();
         assert_eq!(start, 0);
         assert_eq!(end, 2_000);
     }
 
     #[test]
     fn test_compute_sample_window_exact_fit() {
-        let (start, end) = compute_sample_window(4_000, 4_000);
+        let (start, end) =
+            compute_sample_window(4_000, 4_000, SampleAt::Percentage(50.0)).unwrap();
         assert_eq!(start, 0);
         assert_eq!(end, 4_000);
     }
 
     #[test]
     fn test_compute_sample_window_odd_duration() {
-        let (start, end) = compute_sample_window(10_001, 4_000);
+        let (start, end) =
+            compute_sample_window(10_001, 4_000, SampleAt::Percentage(50.0)).unwrap();
         assert_eq!(end - start, 4_000);
+    }
+
+    #[test]
+    fn test_compute_sample_window_pct_at_0() {
+        let (start, end) =
+            compute_sample_window(60_000, 4_000, SampleAt::Percentage(0.0)).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, 4_000);
+    }
+
+    #[test]
+    fn test_compute_sample_window_pct_at_100() {
+        let (start, end) =
+            compute_sample_window(60_000, 4_000, SampleAt::Percentage(100.0)).unwrap();
+        assert_eq!(start, 56_000);
+        assert_eq!(end, 60_000);
+    }
+
+    #[test]
+    fn test_compute_sample_window_pct_at_33() {
+        let (start, end) =
+            compute_sample_window(60_000, 4_000, SampleAt::Percentage(33.0)).unwrap();
+        // center = 60000 * 0.33 = 19800, half = 2000, start = 17800, end = 21800
+        assert_eq!(start, 17_800);
+        assert_eq!(end, 21_800);
+    }
+
+    #[test]
+    fn test_compute_sample_window_absolute_valid() {
+        let (start, end) =
+            compute_sample_window(60_000, 4_000, SampleAt::AbsoluteMs(10_000)).unwrap();
+        assert_eq!(start, 10_000);
+        assert_eq!(end, 14_000);
+    }
+
+    #[test]
+    fn test_compute_sample_window_absolute_exact_end() {
+        let (start, end) =
+            compute_sample_window(60_000, 4_000, SampleAt::AbsoluteMs(56_000)).unwrap();
+        assert_eq!(start, 56_000);
+        assert_eq!(end, 60_000);
+    }
+
+    #[test]
+    fn test_compute_sample_window_absolute_out_of_bounds() {
+        let result = compute_sample_window(60_000, 4_000, SampleAt::AbsoluteMs(57_000));
+        assert!(matches!(result, Err(ShazamError::SampleOutOfBounds { .. })));
+    }
+
+    #[test]
+    fn test_compute_sample_window_absolute_past_end() {
+        let result = compute_sample_window(60_000, 4_000, SampleAt::AbsoluteMs(60_001));
+        assert!(matches!(result, Err(ShazamError::SampleOutOfBounds { .. })));
+    }
+
+    #[test]
+    fn test_sample_at_parse_percentage() {
+        assert!(matches!("50%".parse::<SampleAt>().unwrap(), SampleAt::Percentage(p) if float_cmp::approx_eq!(f64, p, 50.0)));
+        assert!(matches!("0%".parse::<SampleAt>().unwrap(), SampleAt::Percentage(p) if float_cmp::approx_eq!(f64, p, 0.0)));
+        assert!(matches!("100%".parse::<SampleAt>().unwrap(), SampleAt::Percentage(p) if float_cmp::approx_eq!(f64, p, 100.0)));
+        assert!(matches!("33.5%".parse::<SampleAt>().unwrap(), SampleAt::Percentage(p) if float_cmp::approx_eq!(f64, p, 33.5)));
+    }
+
+    #[test]
+    fn test_sample_at_parse_percentage_invalid() {
+        assert!("101%".parse::<SampleAt>().is_err());
+        assert!("-1%".parse::<SampleAt>().is_err());
+        assert!("abc%".parse::<SampleAt>().is_err());
+    }
+
+    #[test]
+    fn test_sample_at_parse_absolute() {
+        assert!(matches!("2:00".parse::<SampleAt>().unwrap(), SampleAt::AbsoluteMs(ms) if ms == 120_000));
+        assert!(matches!("0:00".parse::<SampleAt>().unwrap(), SampleAt::AbsoluteMs(ms) if ms == 0));
+        assert!(matches!("1:30".parse::<SampleAt>().unwrap(), SampleAt::AbsoluteMs(ms) if ms == 90_000));
+        assert!(matches!("10:05".parse::<SampleAt>().unwrap(), SampleAt::AbsoluteMs(ms) if ms == 605_000));
+    }
+
+    #[test]
+    fn test_sample_at_parse_absolute_invalid() {
+        assert!("2:60".parse::<SampleAt>().is_err());
+        assert!("2:5".parse::<SampleAt>().is_err());   // seconds not two digits
+        assert!("2:005".parse::<SampleAt>().is_err()); // seconds not two digits
+        assert!("abc:00".parse::<SampleAt>().is_err());
+        assert!("2:ab".parse::<SampleAt>().is_err());
+    }
+
+    #[test]
+    fn test_sample_at_parse_unknown_format() {
+        assert!("120".parse::<SampleAt>().is_err());
+        assert!("".parse::<SampleAt>().is_err());
+        assert!("2m30s".parse::<SampleAt>().is_err());
     }
 
     #[test]
