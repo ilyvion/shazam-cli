@@ -4,12 +4,20 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+shazam-lib = { path = "shazam-lib" }
+
+clap = { version = "4.6.1", features = ["derive", "env"] }
+miette = { workspace = true, features = ["fancy"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true
 
 [workspace]
 members = ["shazam-lib"]
+
+[workspace.dependencies]
+miette = "7.6.0"
 
 [workspace.lints.rust]
 anonymous_parameters = "deny"

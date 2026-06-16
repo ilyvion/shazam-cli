@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.22.1"
+ffmpeg-next = "8.1.0"
+miette = { workspace = true }
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "query"] }
+thiserror = "2.0.18"
 
 [lints]
 workspace = true
