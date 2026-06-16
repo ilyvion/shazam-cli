@@ -8,7 +8,10 @@ base64 = "0.22.1"
 ffmpeg-next = "8.1.0"
 miette = { workspace = true }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "query"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = "2.0.18"
+tracing = { workspace = true }
 
 [lints]
 workspace = true

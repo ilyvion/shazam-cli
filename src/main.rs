@@ -11,18 +11,33 @@ struct Args {
     /// `RapidAPI` key for the Shazam API (can also be set via `RAPIDAPI_KEY` env var)
     #[arg(long, env = "RAPIDAPI_KEY")]
     api_key: String,
+
+    /// Enable debug logging
+    #[arg(long)]
+    debug: bool,
 }
 
 #[tokio::main]
 async fn main() -> miette::Result<()> {
     let args = Args::parse();
 
+    if args.debug {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .init();
+    }
+
     if !args.file.exists() {
         return Err(miette::miette!("File not found: {}", args.file.display()));
     }
     if !args.file.is_file() {
-        return Err(miette::miette!("Not a regular file: {}", args.file.display()));
+        return Err(miette::miette!(
+            "Not a regular file: {}",
+            args.file.display()
+        ));
     }
+
+    tracing::debug!(path = %args.file.display(), "identifying song");
 
     let result = shazam_lib::identify_song(&args.file, &args.api_key, 4_000).await?;
     println!("{result}");
